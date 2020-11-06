@@ -32,8 +32,8 @@ func (userID UserID) Parse() (localpart, homeserver string, err error) {
 		err = fmt.Errorf("%s is not a valid user id", userID)
 		return
 	}
-	parts := strings.SplitN(string(userID), ":", 2)
-	localpart, homeserver = strings.TrimPrefix(parts[0], "@"), parts[1]
+	parts := strings.Split(string(userID), ":")
+	localpart, homeserver = strings.TrimPrefix(strings.Join(parts[:len(parts)-1], "-"), "@"), parts[len(parts)-1]
 	return
 }
 
