@@ -4,6 +4,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+// +build !nosas
+
 package crypto
 
 import (
@@ -132,6 +134,7 @@ func (mach *OlmMachine) importForwardedRoomKey(evt *DecryptedOlmEvent, content *
 		mach.Log.Error("Failed to store new inbound group session: %v", err)
 		return false
 	}
+	mach.markSessionReceived(content.SessionID)
 	mach.Log.Trace("Created inbound group session %s/%s/%s", content.RoomID, content.SenderKey, content.SessionID)
 	return true
 }
@@ -169,7 +172,7 @@ func (mach *OlmMachine) defaultAllowKeyShare(device *DeviceIdentity, _ event.Req
 	} else if device.Trust == TrustStateBlacklisted {
 		mach.Log.Debug("Ignoring key request from blacklisted device %s", device.DeviceID)
 		return &KeyShareRejectBlacklisted
-	} else if device.Trust == TrustStateVerified {
+	} else if mach.IsDeviceTrusted(device) {
 		mach.Log.Debug("Accepting key request from verified device %s", device.DeviceID)
 		return nil
 	} else if mach.ShareKeysToUnverifiedDevices {

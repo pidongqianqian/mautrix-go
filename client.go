@@ -54,14 +54,6 @@ type Client struct {
 	syncingID uint32 // Identifies the current Sync. Only one Sync can be active at any given time.
 }
 
-// HTTPError An HTTP Error response, which may wrap an underlying native Go Error.
-type HTTPError struct {
-	WrappedError error
-	RespError    *RespError
-	Message      string
-	Code         int
-}
-
 type ClientWellKnown struct {
 	Homeserver     HomeserverInfo     `json:"m.homeserver"`
 	IdentityServer IdentityServerInfo `json:"m.identity_server"`
@@ -114,14 +106,6 @@ func DiscoverClientAPI(serverName string) (*ClientWellKnown, error) {
 	}
 
 	return &wellKnown, nil
-}
-
-func (e HTTPError) Error() string {
-	var wrappedErrMsg string
-	if e.WrappedError != nil {
-		wrappedErrMsg = e.WrappedError.Error()
-	}
-	return fmt.Sprintf("msg=%s code=%d wrapped=%s", e.Message, e.Code, wrappedErrMsg)
 }
 
 // BuildURL builds a URL with the Client's homserver/prefix/access_token set already.
@@ -290,7 +274,10 @@ func (cli *Client) MakeFullRequest(method string, httpURL string, headers http.H
 		var jsonStr []byte
 		jsonStr, err = json.Marshal(reqBody)
 		if err != nil {
-			return nil, err
+			return nil, HTTPError{
+				Message:      "failed to marshal JSON",
+				WrappedError: err,
+			}
 		}
 		logBody = string(jsonStr)
 		req, err = http.NewRequest(method, httpURL, bytes.NewBuffer(jsonStr))
@@ -298,7 +285,10 @@ func (cli *Client) MakeFullRequest(method string, httpURL string, headers http.H
 		req, err = http.NewRequest(method, httpURL, nil)
 	}
 	if err != nil {
-		return nil, err
+		return nil, HTTPError{
+			Message:      "failed to create request",
+			WrappedError: err,
+		}
 	}
 	if headers != nil {
 		req.Header = headers
@@ -316,48 +306,58 @@ func (cli *Client) MakeFullRequest(method string, httpURL string, headers http.H
 		defer res.Body.Close()
 	}
 	if err != nil {
-		return nil, err
+		return nil, HTTPError{
+			Request:  req,
+			Response: res,
+
+			Message:      "request error",
+			WrappedError: err,
+		}
 	}
 
 	contents, err := ioutil.ReadAll(res.Body)
 	if err != nil {
-		return nil, err
+		return nil, HTTPError{
+			Request:  req,
+			Response: res,
+
+			Message:      "failed to read response body",
+			WrappedError: err,
+		}
 	}
 
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		var wrap error
 		respErr := &RespError{}
-		if _ = json.Unmarshal(contents, respErr); respErr.ErrCode != "" {
-			wrap = respErr
-		} else {
+		if _ = json.Unmarshal(contents, respErr); respErr.ErrCode == "" {
 			respErr = nil
 		}
 
-		// If we failed to decode as RespError, don't just drop the HTTP body, include it in the
-		// HTTP error instead (e.g proxy errors which return HTML).
-		msg := "Failed to " + method + " JSON to " + req.URL.Path
-		if wrap == nil {
-			msg = msg + ": " + string(contents)
-		}
-
 		return contents, HTTPError{
-			Code:         res.StatusCode,
-			Message:      msg,
-			WrappedError: wrap,
-			RespError:    respErr,
+			Request:   req,
+			Response:  res,
+			RespError: respErr,
 		}
 	}
 
-	if resBody != nil {
-		if err = json.Unmarshal(contents, &resBody); err != nil {
-			return nil, err
+	if resBody == nil {
+		return contents, nil
+	}
+
+	if err = json.Unmarshal(contents, &resBody); err != nil {
+		return nil, HTTPError{
+			Request:  req,
+			Response: res,
+
+			Message:      "failed to unmarshal response body",
+			ResponseBody: string(contents),
+			WrappedError: err,
 		}
-		return nil, nil
 	}
 
 	return contents, nil
 }
 
+// Whoami gets the user ID of the current user. See https://matrix.org/docs/spec/client_server/r0.6.1#post-matrix-client-r0-rooms-roomid-join
 func (cli *Client) Whoami() (resp *RespWhoami, err error) {
 	urlPath := cli.BuildURL("account", "whoami")
 	_, err = cli.MakeRequest("GET", urlPath, nil, &resp)
@@ -401,7 +401,7 @@ func (cli *Client) register(url string, req *ReqRegister) (resp *RespRegister, u
 		if !ok { // network error
 			return
 		}
-		if httpErr.Code == 401 {
+		if httpErr.IsStatus(http.StatusUnauthorized) {
 			// body should be RespUserInteractive, if it isn't, fail with the error
 			err = json.Unmarshal(bodyBytes, &uiaResp)
 			return
@@ -492,14 +492,14 @@ func (cli *Client) Logout() (resp *RespLogout, err error) {
 	return
 }
 
-// Versions returns the list of supported Matrix versions on this homeserver. See http://matrix.org/docs/spec/client_server/r0.2.0.html#get-matrix-client-versions
+// Versions returns the list of supported Matrix versions on this homeserver. See http://matrix.org/docs/spec/client_server/r0.6.1.html#get-matrix-client-versions
 func (cli *Client) Versions() (resp *RespVersions, err error) {
 	urlPath := cli.BuildBaseURL("_matrix", "client", "versions")
 	_, err = cli.MakeRequest("GET", urlPath, nil, &resp)
 	return
 }
 
-// JoinRoom joins the client to a room ID or alias. See http://matrix.org/docs/spec/client_server/r0.2.0.html#post-matrix-client-r0-join-roomidoralias
+// JoinRoom joins the client to a room ID or alias. See http://matrix.org/docs/spec/client_server/r0.6.1.html#post-matrix-client-r0-join-roomidoralias
 //
 // If serverName is specified, this will be added as a query param to instruct the homeserver to join via that server. If content is specified, it will
 // be JSON encoded and used as the request body.
@@ -516,26 +516,28 @@ func (cli *Client) JoinRoom(roomIDorAlias, serverName string, content interface{
 	return
 }
 
+// JoinRoomByID joins the client to a room ID. See https://matrix.org/docs/spec/client_server/r0.6.1#post-matrix-client-r0-rooms-roomid-join
+//
+// Unlike JoinRoom, this method can only be used to join rooms that the server already knows about.
+// It's mostly intended for bridges and other things where it's already certain that the server is in the room.
 func (cli *Client) JoinRoomByID(roomID id.RoomID) (resp *RespJoinRoom, err error) {
 	_, err = cli.MakeRequest("POST", cli.BuildURL("rooms", roomID, "join"), nil, &resp)
 	return
 }
 
-// GetDisplayName returns the display name of the user from the specified MXID. See https://matrix.org/docs/spec/client_server/r0.2.0.html#get-matrix-client-r0-profile-userid-displayname
-func (cli *Client) GetDisplayName(mxid string) (resp *RespUserDisplayName, err error) {
+// GetDisplayName returns the display name of the user with the specified MXID. See https://matrix.org/docs/spec/client_server/r0.6.1.html#get-matrix-client-r0-profile-userid-displayname
+func (cli *Client) GetDisplayName(mxid id.UserID) (resp *RespUserDisplayName, err error) {
 	urlPath := cli.BuildURL("profile", mxid, "displayname")
 	_, err = cli.MakeRequest("GET", urlPath, nil, &resp)
 	return
 }
 
-// GetOwnDisplayName returns the user's display name. See https://matrix.org/docs/spec/client_server/r0.2.0.html#get-matrix-client-r0-profile-userid-displayname
+// GetOwnDisplayName returns the user's display name. See https://matrix.org/docs/spec/client_server/r0.6.1.html#get-matrix-client-r0-profile-userid-displayname
 func (cli *Client) GetOwnDisplayName() (resp *RespUserDisplayName, err error) {
-	urlPath := cli.BuildURL("profile", cli.UserID, "displayname")
-	_, err = cli.MakeRequest("GET", urlPath, nil, &resp)
-	return
+	return cli.GetDisplayName(cli.UserID)
 }
 
-// SetDisplayName sets the user's profile display name. See http://matrix.org/docs/spec/client_server/r0.2.0.html#put-matrix-client-r0-profile-userid-displayname
+// SetDisplayName sets the user's profile display name. See http://matrix.org/docs/spec/client_server/r0.6.1.html#put-matrix-client-r0-profile-userid-displayname
 func (cli *Client) SetDisplayName(displayName string) (err error) {
 	urlPath := cli.BuildURL("profile", cli.UserID, "displayname")
 	s := struct {
@@ -545,22 +547,27 @@ func (cli *Client) SetDisplayName(displayName string) (err error) {
 	return
 }
 
-// GetAvatarURL gets the user's avatar URL. See http://matrix.org/docs/spec/client_server/r0.2.0.html#get-matrix-client-r0-profile-userid-avatar-url
-func (cli *Client) GetAvatarURL() (url string, err error) {
+// GetAvatarURL gets the avatar URL of the user with the specified MXID. See http://matrix.org/docs/spec/client_server/r0.6.1.html#get-matrix-client-r0-profile-userid-avatar-url
+func (cli *Client) GetAvatarURL(mxid id.UserID) (url id.ContentURI, err error) {
 	urlPath := cli.BuildURL("profile", cli.UserID, "avatar_url")
 	s := struct {
-		AvatarURL string `json:"avatar_url"`
+		AvatarURL id.ContentURI `json:"avatar_url"`
 	}{}
 
 	_, err = cli.MakeRequest("GET", urlPath, nil, &s)
 	if err != nil {
-		return "", err
+		return
 	}
-
-	return s.AvatarURL, nil
+	url = s.AvatarURL
+	return
 }
 
-// SetAvatarURL sets the user's avatar URL. See http://matrix.org/docs/spec/client_server/r0.2.0.html#put-matrix-client-r0-profile-userid-avatar-url
+// GetOwnAvatarURL gets the user's avatar URL. See http://matrix.org/docs/spec/client_server/r0.6.1.html#get-matrix-client-r0-profile-userid-avatar-url
+func (cli *Client) GetOwnAvatarURL() (url id.ContentURI, err error) {
+	return cli.GetAvatarURL(cli.UserID)
+}
+
+// SetAvatarURL sets the user's avatar URL. See http://matrix.org/docs/spec/client_server/r0.6.1.html#put-matrix-client-r0-profile-userid-avatar-url
 func (cli *Client) SetAvatarURL(url id.ContentURI) (err error) {
 	urlPath := cli.BuildURL("profile", cli.UserID, "avatar_url")
 	s := struct {
@@ -873,7 +880,10 @@ func (cli *Client) UploadMedia(data ReqUploadMedia) (*RespMediaUpload, error) {
 
 	req, err := http.NewRequest("POST", u.String(), data.Content)
 	if err != nil {
-		return nil, err
+		return nil, HTTPError{
+			WrappedError: err,
+			Message:      "failed to create request",
+		}
 	}
 
 	if len(data.ContentType) > 0 {
@@ -894,19 +904,34 @@ func (cli *Client) UploadMedia(data ReqUploadMedia) (*RespMediaUpload, error) {
 	contents, err := ioutil.ReadAll(res.Body)
 	if err != nil {
 		return nil, HTTPError{
-			Message: "Upload request failed - Failed to read response body: " + err.Error(),
-			Code:    res.StatusCode,
+			Message:      "failed to read upload response body",
+			WrappedError: err,
+			Response:     res,
+			Request:      req,
 		}
 	}
 	if res.StatusCode != 200 {
+		respErr := &RespError{}
+		if _ = json.Unmarshal(contents, respErr); respErr.ErrCode == "" {
+			respErr = nil
+		}
+
 		return nil, HTTPError{
-			Message: "Upload request failed: " + string(contents),
-			Code:    res.StatusCode,
+			Request:   req,
+			Response:  res,
+			RespError: respErr,
 		}
 	}
 	var m RespMediaUpload
 	if err := json.Unmarshal(contents, &m); err != nil {
-		return nil, err
+		return nil, HTTPError{
+			Request:  req,
+			Response: res,
+
+			Message:      "failed to unmarshal upload response body",
+			ResponseBody: string(contents),
+			WrappedError: err,
+		}
 	}
 	return &m, nil
 }
@@ -1069,6 +1094,35 @@ func (cli *Client) GetKeyChanges(from, to string) (resp *RespKeyChanges, err err
 func (cli *Client) SendToDevice(eventType event.Type, req *ReqSendToDevice) (resp *RespSendToDevice, err error) {
 	urlPath := cli.BuildURL("sendToDevice", eventType.String(), cli.TxnID())
 	_, err = cli.MakeRequest("PUT", urlPath, req, &resp)
+	return
+}
+
+type UIACallback = func(*RespUserInteractive) interface{}
+
+// UploadCrossSigningKeys uploads the given cross-signing keys to the server.
+// Because the endpoint requires user-interactive authentication a callback must be provided that,
+// given the UI auth parameters, produces the required result (or nil to end the flow).
+func (cli *Client) UploadCrossSigningKeys(keys *UploadCrossSigningKeysReq, uiaCallback UIACallback) error {
+	urlPath := cli.BuildBaseURL("_matrix", "client", "unstable", "keys", "device_signing", "upload")
+	content, err := cli.MakeRequest("POST", urlPath, keys, nil)
+	if respErr, ok := err.(HTTPError); ok && respErr.IsStatus(http.StatusUnauthorized) {
+		// try again with UI auth
+		var uiAuthResp RespUserInteractive
+		if err := json.Unmarshal(content, &uiAuthResp); err != nil {
+			return fmt.Errorf("failed to decode UIA response: %w", err)
+		}
+		auth := uiaCallback(&uiAuthResp)
+		if auth != nil {
+			keys.Auth = auth
+			return cli.UploadCrossSigningKeys(keys, uiaCallback)
+		}
+	}
+	return err
+}
+
+func (cli *Client) UploadSignatures(req *ReqUploadSignatures) (resp *RespUploadSignatures, err error) {
+	urlPath := cli.BuildBaseURL("_matrix", "client", "unstable", "keys", "signatures", "upload")
+	_, err = cli.MakeRequest("POST", urlPath, req, &resp)
 	return
 }
 
