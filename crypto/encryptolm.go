@@ -8,8 +8,7 @@ package crypto
 
 import (
 	"encoding/json"
-
-	"github.com/pkg/errors"
+	"fmt"
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/crypto/olm"
@@ -69,7 +68,7 @@ func (mach *OlmMachine) createOutboundSessions(input map[id.UserID]map[id.Device
 		Timeout:     10 * 1000,
 	})
 	if err != nil {
-		return errors.Wrap(err, "failed to claim keys")
+		return fmt.Errorf("failed to claim keys: %w", err)
 	}
 	for userID, user := range resp.OneTimeKeys {
 		for deviceID, oneTimeKeys := range user {
@@ -84,7 +83,7 @@ func (mach *OlmMachine) createOutboundSessions(input map[id.UserID]map[id.Device
 				continue
 			}
 			identity := input[userID][deviceID]
-			if ok, err := olm.VerifySignatureJSON(oneTimeKey, userID, deviceID, identity.SigningKey); err != nil {
+			if ok, err := olm.VerifySignatureJSON(oneTimeKey, userID, deviceID.String(), identity.SigningKey); err != nil {
 				mach.Log.Error("Failed to verify signature for %s of %s: %v", deviceID, userID, err)
 			} else if !ok {
 				mach.Log.Warn("Invalid signature for %s of %s", deviceID, userID)

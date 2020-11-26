@@ -2,13 +2,14 @@ package sql_store_upgrade
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
-
-	"github.com/pkg/errors"
 )
 
 type upgradeFunc func(*sql.Tx, string) error
+
+var ErrUnknownDialect = errors.New("unknown dialect")
 
 var Upgrades = [...]upgradeFunc{
 	func(tx *sql.Tx, _ string) error {
@@ -153,7 +154,7 @@ var Upgrades = [...]upgradeFunc{
 				}
 			}
 		} else {
-			return errors.New("unknown dialect: " + dialect)
+			return fmt.Errorf("%w (%s)", ErrUnknownDialect, dialect)
 		}
 		return nil
 	},
@@ -203,7 +204,32 @@ var Upgrades = [...]upgradeFunc{
 				return err
 			}
 		} else {
-			return errors.New("unknown dialect: " + dialect)
+			return fmt.Errorf("%w (%s)", ErrUnknownDialect, dialect)
+		}
+		return nil
+	},
+	func(tx *sql.Tx, dialect string) error {
+		if _, err := tx.Exec(
+			`CREATE TABLE IF NOT EXISTS crypto_cross_signing_keys (
+				user_id VARCHAR(255) NOT NULL,
+				usage   VARCHAR(20)  NOT NULL,
+				key     CHAR(43)     NOT NULL,
+				PRIMARY KEY (user_id, usage)
+			)`,
+		); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(
+			`CREATE TABLE IF NOT EXISTS crypto_cross_signing_signatures (
+				signed_user_id VARCHAR(255) NOT NULL,
+				signed_key     VARCHAR(255) NOT NULL,
+				signer_user_id VARCHAR(255) NOT NULL,
+				signer_key     VARCHAR(255) NOT NULL,
+				signature      CHAR(88)     NOT NULL,
+				PRIMARY KEY (signed_user_id, signed_key, signer_user_id, signer_key)
+			)`,
+		); err != nil {
+			return err
 		}
 		return nil
 	},
@@ -234,6 +260,7 @@ func SetVersion(tx *sql.Tx, version int) error {
 	return err
 }
 
+// Upgrade upgrades the database from the current to the latest version available.
 func Upgrade(db *sql.DB, dialect string) error {
 	version, err := GetVersion(db)
 	if err != nil {

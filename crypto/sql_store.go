@@ -10,9 +10,9 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/lib/pq"
-	"github.com/pkg/errors"
 
 	"maunium.net/go/mautrix/crypto/olm"
 	"maunium.net/go/mautrix/crypto/sql_store_upgrade"
@@ -31,6 +31,9 @@ type SQLCryptoStore struct {
 	SyncToken string
 	PickleKey []byte
 	Account   *OlmAccount
+
+	olmSessionCache map[id.SenderKey]map[id.SessionID]*OlmSession
+	olmSessionCacheLock sync.Mutex
 }
 
 var _ Store = (*SQLCryptoStore)(nil)
@@ -45,6 +48,8 @@ func NewSQLCryptoStore(db *sql.DB, dialect string, accountID string, deviceID id
 		PickleKey: pickleKey,
 		AccountID: accountID,
 		DeviceID:  deviceID,
+
+		olmSessionCache: make(map[id.SenderKey]map[id.SessionID]*OlmSession),
 	}
 }
 
@@ -125,7 +130,12 @@ func (store *SQLCryptoStore) GetAccount() (*OlmAccount, error) {
 
 // HasSession returns whether there is an Olm session for the given sender key.
 func (store *SQLCryptoStore) HasSession(key id.SenderKey) bool {
-	// TODO this may need to be changed if olm sessions start expiring
+	store.olmSessionCacheLock.Lock()
+	cache, ok := store.olmSessionCache[key]
+	store.olmSessionCacheLock.Unlock()
+	if ok && len(cache) > 0 {
+		return true
+	}
 	var sessionID id.SessionID
 	err := store.DB.QueryRow("SELECT session_id FROM crypto_olm_session WHERE sender_key=$1 AND account_id=$2 LIMIT 1",
 		key, store.AccountID).Scan(&sessionID)
@@ -137,53 +147,88 @@ func (store *SQLCryptoStore) HasSession(key id.SenderKey) bool {
 
 // GetSessions returns all the known Olm sessions for a sender key.
 func (store *SQLCryptoStore) GetSessions(key id.SenderKey) (OlmSessionList, error) {
-	rows, err := store.DB.Query("SELECT session, created_at, last_used FROM crypto_olm_session WHERE sender_key=$1 AND account_id=$2 ORDER BY session_id",
+	rows, err := store.DB.Query("SELECT session_id, session, created_at, last_used FROM crypto_olm_session WHERE sender_key=$1 AND account_id=$2 ORDER BY session_id",
 		key, store.AccountID)
 	if err != nil {
 		return nil, err
 	}
 	list := OlmSessionList{}
+	store.olmSessionCacheLock.Lock()
+	defer store.olmSessionCacheLock.Unlock()
+	cache := store.getOlmSessionCache(key)
 	for rows.Next() {
 		sess := OlmSession{Internal: *olm.NewBlankSession()}
 		var sessionBytes []byte
-		err := rows.Scan(&sessionBytes, &sess.CreationTime, &sess.UseTime)
+		var sessionID id.SessionID
+		err := rows.Scan(&sessionID, &sessionBytes, &sess.CreationTime, &sess.UseTime)
 		if err != nil {
 			return nil, err
+		} else if existing, ok := cache[sessionID]; ok {
+			list = append(list, existing)
+		} else {
+			err = sess.Internal.Unpickle(sessionBytes, store.PickleKey)
+			if err != nil {
+				return nil, err
+			}
+			list = append(list, &sess)
+			cache[sess.ID()] = &sess
 		}
-		err = sess.Internal.Unpickle(sessionBytes, store.PickleKey)
-		if err != nil {
-			return nil, err
-		}
-		list = append(list, &sess)
 	}
 	return list, nil
 }
 
+func (store *SQLCryptoStore) getOlmSessionCache(key id.SenderKey) map[id.SessionID]*OlmSession {
+	data, ok := store.olmSessionCache[key]
+	if !ok {
+		data = make(map[id.SessionID]*OlmSession)
+		store.olmSessionCache[key] = data
+	}
+	return data
+}
+
 // GetLatestSession retrieves the Olm session for a given sender key from the database that has the largest ID.
 func (store *SQLCryptoStore) GetLatestSession(key id.SenderKey) (*OlmSession, error) {
-	row := store.DB.QueryRow("SELECT session, created_at, last_used FROM crypto_olm_session WHERE sender_key=$1 AND account_id=$2 ORDER BY session_id DESC LIMIT 1",
+	store.olmSessionCacheLock.Lock()
+	defer store.olmSessionCacheLock.Unlock()
+
+	row := store.DB.QueryRow("SELECT session_id, session, created_at, last_used FROM crypto_olm_session WHERE sender_key=$1 AND account_id=$2 ORDER BY session_id DESC LIMIT 1",
 		key, store.AccountID)
+
 	sess := OlmSession{Internal: *olm.NewBlankSession()}
 	var sessionBytes []byte
-	err := row.Scan(&sessionBytes, &sess.CreationTime, &sess.UseTime)
+	var sessionID id.SessionID
+
+	err := row.Scan(&sessionID, &sessionBytes, &sess.CreationTime, &sess.UseTime)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	} else if err != nil {
 		return nil, err
 	}
-	return &sess, sess.Internal.Unpickle(sessionBytes, store.PickleKey)
+
+	cache := store.getOlmSessionCache(key)
+	if oldSess, ok := cache[sessionID]; ok {
+		return oldSess, nil
+	} else if err = sess.Internal.Unpickle(sessionBytes, store.PickleKey); err != nil {
+		return nil, err
+	} else {
+		cache[sessionID] = &sess
+		return &sess, nil
+	}
 }
 
 // AddSession persists an Olm session for a sender in the database.
 func (store *SQLCryptoStore) AddSession(key id.SenderKey, session *OlmSession) error {
+	store.olmSessionCacheLock.Lock()
+	defer store.olmSessionCacheLock.Unlock()
 	sessionBytes := session.Internal.Pickle(store.PickleKey)
 	_, err := store.DB.Exec("INSERT INTO crypto_olm_session (session_id, sender_key, session, created_at, last_used, account_id) VALUES ($1, $2, $3, $4, $5, $6)",
 		session.ID(), key, sessionBytes, session.CreationTime, session.UseTime, store.AccountID)
+	store.getOlmSessionCache(key)[session.ID()] = session
 	return err
 }
 
 // UpdateSession replaces the Olm session for a sender in the database.
-func (store *SQLCryptoStore) UpdateSession(key id.SenderKey, session *OlmSession) error {
+func (store *SQLCryptoStore) UpdateSession(_ id.SenderKey, session *OlmSession) error {
 	sessionBytes := session.Internal.Pickle(store.PickleKey)
 	_, err := store.DB.Exec("UPDATE crypto_olm_session SET session=$1, last_used=$2 WHERE session_id=$3 AND account_id=$4",
 		sessionBytes, session.UseTime, session.ID(), store.AccountID)
@@ -224,7 +269,7 @@ func (store *SQLCryptoStore) GetGroupSession(roomID id.RoomID, senderKey id.Send
 	} else if err != nil {
 		return nil, err
 	} else if withheldCode.Valid {
-		return nil, ErrGroupSessionWithheld
+		return nil, fmt.Errorf("%w (%s)", ErrGroupSessionWithheld, withheldCode.String)
 	}
 	igs := olm.NewBlankInboundGroupSession()
 	err = igs.Unpickle(sessionBytes, store.PickleKey)
@@ -266,6 +311,61 @@ func (store *SQLCryptoStore) GetWithheldGroupSession(roomID id.RoomID, senderKey
 		Code:      event.RoomKeyWithheldCode(code.String),
 		Reason:    reason.String,
 	}, nil
+}
+
+func (store *SQLCryptoStore) scanGroupSessionList(rows *sql.Rows) (result []*InboundGroupSession) {
+	for rows.Next() {
+		var roomID id.RoomID
+		var signingKey, senderKey, forwardingChains sql.NullString
+		var sessionBytes []byte
+		err := rows.Scan(&roomID, &signingKey, &senderKey, &sessionBytes, &forwardingChains)
+		if err != nil {
+			store.Log.Warn("Failed to scan row: %v", err)
+			continue
+		}
+		igs := olm.NewBlankInboundGroupSession()
+		err = igs.Unpickle(sessionBytes, store.PickleKey)
+		if err != nil {
+			store.Log.Warn("Failed to unpickle session: %v", err)
+			continue
+		}
+		result = append(result, &InboundGroupSession{
+			Internal:         *igs,
+			SigningKey:       id.Ed25519(signingKey.String),
+			SenderKey:        id.Curve25519(senderKey.String),
+			RoomID:           roomID,
+			ForwardingChains: strings.Split(forwardingChains.String, ","),
+		})
+	}
+	return
+}
+
+func (store *SQLCryptoStore) GetGroupSessionsForRoom(roomID id.RoomID) ([]*InboundGroupSession, error) {
+	rows, err := store.DB.Query(`
+		SELECT room_id, signing_key, sender_key, session, forwarding_chains
+		FROM crypto_megolm_inbound_session WHERE room_id=$1 AND account_id=$2`,
+		roomID, store.AccountID,
+	)
+	if err == sql.ErrNoRows {
+		return []*InboundGroupSession{}, nil
+	} else if err != nil {
+		return nil, err
+	}
+	return store.scanGroupSessionList(rows), nil
+}
+
+func (store *SQLCryptoStore) GetAllGroupSessions() ([]*InboundGroupSession, error) {
+	rows, err := store.DB.Query(`
+		SELECT room_id, signing_key, sender_key, session, forwarding_chains
+		FROM crypto_megolm_inbound_session WHERE account_id=$2`,
+		store.AccountID,
+	)
+	if err == sql.ErrNoRows {
+		return []*InboundGroupSession{}, nil
+	} else if err != nil {
+		return nil, err
+	}
+	return store.scanGroupSessionList(rows), nil
 }
 
 // AddOutboundGroupSession stores an outbound Megolm session, along with the information about the room and involved devices.
@@ -437,18 +537,18 @@ func (store *SQLCryptoStore) PutDevices(userID id.UserID, devices map[id.DeviceI
 		err = fmt.Errorf("unsupported dialect %s", store.Dialect)
 	}
 	if err != nil {
-		return errors.Wrap(err, "failed to add user to tracked users list")
+		return fmt.Errorf("failed to add user to tracked users list: %w", err)
 	}
 
 	_, err = tx.Exec("DELETE FROM crypto_device WHERE user_id=$1", userID)
 	if err != nil {
 		_ = tx.Rollback()
-		return errors.Wrap(err, "failed to delete old devices")
+		return fmt.Errorf("failed to delete old devices: %w", err)
 	}
 	if len(devices) == 0 {
 		err = tx.Commit()
 		if err != nil {
-			return errors.Wrap(err, "failed to commit changes (no devices added)")
+			return fmt.Errorf("failed to commit changes (no devices added): %w", err)
 		}
 		return nil
 	}
@@ -478,12 +578,12 @@ func (store *SQLCryptoStore) PutDevices(userID id.UserID, devices map[id.DeviceI
 		_, err = tx.Exec("INSERT INTO crypto_device (user_id, device_id, identity_key, signing_key, trust, deleted, name) VALUES "+valueString, values...)
 		if err != nil {
 			_ = tx.Rollback()
-			return errors.Wrap(err, "failed to insert new devices")
+			return fmt.Errorf("failed to insert new devices: %w", err)
 		}
 	}
 	err = tx.Commit()
 	if err != nil {
-		return errors.Wrap(err, "failed to commit changes")
+		return fmt.Errorf("failed to commit changes: %w", err)
 	}
 	return nil
 }
@@ -517,4 +617,108 @@ func (store *SQLCryptoStore) FilterTrackedUsers(users []id.UserID) []id.UserID {
 		}
 	}
 	return users[:ptr]
+}
+
+// PutCrossSigningKey stores a cross-signing key of some user along with its usage.
+func (store *SQLCryptoStore) PutCrossSigningKey(userID id.UserID, usage id.CrossSigningUsage, key id.Ed25519) error {
+	var err error
+	if store.Dialect == "postgres" {
+		_, err = store.DB.Exec(`
+			INSERT INTO crypto_cross_signing_keys (user_id, usage, key) VALUES ($1, $2, $3) ON CONFLICT (user_id, usage) DO UPDATE SET key=$3`,
+			userID, usage, key)
+	} else if store.Dialect == "sqlite3" {
+		_, err = store.DB.Exec("INSERT OR REPLACE INTO crypto_cross_signing_keys (user_id, usage, key) VALUES ($1, $2, $3)",
+			userID, usage, key)
+	} else {
+		err = fmt.Errorf("unsupported dialect %s", store.Dialect)
+	}
+	if err != nil {
+		store.Log.Warn("Failed to store cross-signing key: %v", err)
+	}
+	return nil
+}
+
+// GetCrossSigningKeys retrieves a user's stored cross-signing keys.
+func (store *SQLCryptoStore) GetCrossSigningKeys(userID id.UserID) (map[id.CrossSigningUsage]id.Ed25519, error) {
+	rows, err := store.DB.Query("SELECT usage, key FROM crypto_cross_signing_keys WHERE user_id=$1", userID)
+	if err != nil {
+		return nil, err
+	}
+	data := make(map[id.CrossSigningUsage]id.Ed25519)
+	for rows.Next() {
+		var usage id.CrossSigningUsage
+		var key id.Ed25519
+		err := rows.Scan(&usage, &key)
+		if err != nil {
+			return nil, err
+		}
+		data[usage] = key
+	}
+
+	return data, nil
+}
+
+// PutSignature stores a signature of a cross-signing or device key along with the signer's user ID and key.
+func (store *SQLCryptoStore) PutSignature(signedUserID id.UserID, signedKey id.Ed25519, signerUserID id.UserID, signerKey id.Ed25519, signature string) error {
+	var err error
+	if store.Dialect == "postgres" {
+		_, err = store.DB.Exec(`
+			INSERT INTO crypto_cross_signing_signatures (signed_user_id, signed_key, signer_user_id, signer_key, signature) VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT (signed_user_id, signed_key, signer_user_id, signer_key) DO UPDATE SET signature=$5`,
+			signedUserID, signedKey, signerUserID, signerKey, signature)
+	} else if store.Dialect == "sqlite3" {
+		_, err = store.DB.Exec(`
+			INSERT OR REPLACE INTO crypto_cross_signing_signatures (signed_user_id, signed_key, signer_user_id, signer_key, signature)
+			VALUES ($1, $2, $3, $4, $5)`,
+			signedUserID, signedKey, signerUserID, signerKey, signature)
+	} else {
+		err = fmt.Errorf("unsupported dialect %s", store.Dialect)
+	}
+	if err != nil {
+		store.Log.Warn("Failed to store signature: %v", err)
+	}
+	return nil
+}
+
+// GetSignaturesForKeyBy retrieves the stored signatures for a given cross-signing or device key, by the given signer.
+func (store *SQLCryptoStore) GetSignaturesForKeyBy(userID id.UserID, key id.Ed25519, signerID id.UserID) (map[id.Ed25519]string, error) {
+	rows, err := store.DB.Query("SELECT signer_key, signature FROM crypto_cross_signing_signatures WHERE signed_user_id=$1 AND signed_key=$2 AND signer_user_id=$3", userID, key, signerID)
+	if err != nil {
+		return nil, err
+	}
+	data := make(map[id.Ed25519]string)
+	for rows.Next() {
+		var signerKey id.Ed25519
+		var signature string
+		err := rows.Scan(&signerKey, &signature)
+		if err != nil {
+			return nil, err
+		}
+		data[signerKey] = signature
+	}
+
+	return data, nil
+}
+
+// IsKeySignedBy returns whether a cross-signing or device key is signed by the given signer.
+func (store *SQLCryptoStore) IsKeySignedBy(userID id.UserID, key id.Ed25519, signerID id.UserID, signerKey id.Ed25519) (bool, error) {
+	sigs, err := store.GetSignaturesForKeyBy(userID, key, signerID)
+	if err != nil {
+		return false, err
+	}
+	_, ok := sigs[signerKey]
+	return ok, nil
+}
+
+// DropSignaturesByKey deletes the signatures made by the given user and key from the store. It returns the number of signatures deleted.
+func (store *SQLCryptoStore) DropSignaturesByKey(userID id.UserID, key id.Ed25519) (int64, error) {
+	res, err := store.DB.Exec("DELETE FROM crypto_cross_signing_signatures WHERE signer_user_id=$1 AND signer_key=$2", userID, key)
+	if err != nil {
+		return 0, err
+	}
+	count, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
 }
