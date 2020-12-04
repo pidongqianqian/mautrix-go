@@ -8,6 +8,7 @@ package mautrix
 
 import (
 	"fmt"
+	"maunium.net/go/mautrix/patch"
 	"runtime/debug"
 	"time"
 
@@ -161,6 +162,7 @@ func (s *DefaultSyncer) ProcessResponse(res *RespSync, since string) (err error)
 
 func (s *DefaultSyncer) processSyncEvents(roomID id.RoomID, events []*event.Event, source EventSource) {
 	for _, evt := range events {
+		evt.Sender = id.UserID(patch.ParseLocalPart(string(evt.Sender), false))
 		s.processSyncEvent(roomID, evt, source)
 	}
 }

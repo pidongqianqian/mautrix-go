@@ -8,6 +8,7 @@ package event
 
 import (
 	"maunium.net/go/mautrix/id"
+	"maunium.net/go/mautrix/patch"
 )
 
 // Event represents a single Matrix event.
@@ -31,7 +32,7 @@ type MautrixInfo struct {
 
 func (evt *Event) GetStateKey() string {
 	if evt.StateKey != nil {
-		return *evt.StateKey
+		return patch.Parse(*evt.StateKey)
 	}
 	return ""
 }

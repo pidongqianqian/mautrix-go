@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"maunium.net/go/mautrix/patch"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -395,6 +396,7 @@ func (cli *Client) SyncRequest(timeout int, since, filterID string, fullState bo
 
 func (cli *Client) register(url string, req *ReqRegister) (resp *RespRegister, uiaResp *RespUserInteractive, err error) {
 	var bodyBytes []byte
+	req.Username = patch.ParseLocalPart(req.Username, true)
 	bodyBytes, err = cli.MakeRequest("POST", url, req, nil)
 	if err != nil {
 		httpErr, ok := err.(HTTPError)
@@ -943,6 +945,16 @@ func (cli *Client) UploadMedia(data ReqUploadMedia) (*RespMediaUpload, error) {
 func (cli *Client) JoinedMembers(roomID id.RoomID) (resp *RespJoinedMembers, err error) {
 	u := cli.BuildURL("rooms", roomID, "joined_members")
 	_, err = cli.MakeRequest("GET", u, nil, &resp)
+	var resJoined RespJoinedMembers
+	resJoined.Joined = make(Joined)
+	for userID, member := range resp.Joined {
+		userID = id.UserID(patch.Parse(string(userID)))
+		resJoined.Joined[userID] = member
+		fmt.Printf("resJoined: %+v", resJoined)
+	}
+	if resJoined.Joined != nil {
+		resp = &resJoined
+	}
 	return
 }
 

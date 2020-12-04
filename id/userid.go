@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"fmt"
+	"maunium.net/go/mautrix/patch"
 	"strings"
 )
 
@@ -18,6 +19,7 @@ import (
 type UserID string
 
 func NewUserID(localpart, homeserver string) UserID {
+	localpart = patch.ParseLocalPart(localpart, true)
 	return UserID(fmt.Sprintf("@%s:%s", localpart, homeserver))
 }
 
@@ -34,6 +36,7 @@ func (userID UserID) Parse() (localpart, homeserver string, err error) {
 	}
 	parts := strings.Split(string(userID), ":")
 	localpart, homeserver = strings.TrimPrefix(strings.Join(parts[:len(parts)-1], "-"), "@"), parts[len(parts)-1]
+	localpart = patch.ParseLocalPart(localpart, false)
 	return
 }
 

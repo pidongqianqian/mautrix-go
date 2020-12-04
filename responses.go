@@ -56,10 +56,12 @@ type RespJoinedRooms struct {
 
 // RespJoinedMembers is the JSON response for https://matrix.org/docs/spec/client_server/r0.4.0.html#get-matrix-client-r0-joined-rooms
 type RespJoinedMembers struct {
-	Joined map[id.UserID]struct {
-		DisplayName *string `json:"display_name"`
-		AvatarURL   *string `json:"avatar_url"`
-	} `json:"joined"`
+	Joined Joined `json:"joined"`
+}
+
+type Joined map[id.UserID]struct {
+	DisplayName *string `json:"display_name"`
+	AvatarURL   *string `json:"avatar_url"`
 }
 
 // RespMessages is the JSON response for https://matrix.org/docs/spec/client_server/r0.2.0.html#get-matrix-client-r0-rooms-roomid-messages
