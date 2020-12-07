@@ -91,7 +91,7 @@ func (intent *IntentAPI) EnsureJoined(roomID id.RoomID) error {
 			return fmt.Errorf("failed to ensure joined: %w", err)
 		}
 	}
-	intent.as.StateStore.SetMembership(resp.RoomID, intent.UserID, "join")
+	intent.as.StateStore.SetMembership(resp.RoomID, id.UserID(patch.Parse(string(intent.UserID))), "join")
 	return nil
 }
 
