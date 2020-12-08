@@ -17,7 +17,7 @@ var AsUserPrefix string
 var XorKey string
 
 func Parse(stateKey string) string {
-	if ThirdPartyIdEncrypt && stateKey != AsBotName {
+	if ThirdPartyIdEncrypt && len(stateKey)>0 && stateKey != AsBotName {
 		if strings.Index(stateKey, AsUserPrefix) == 1 {
 			userIdArr := strings.Split(stateKey, AsUserPrefix)
 			userIdArrLast := strings.Split(userIdArr[1], ":")
@@ -28,7 +28,7 @@ func Parse(stateKey string) string {
 }
 
 func ParseLocalPart(localpart string, encrypt bool) string {
-	if ThirdPartyIdEncrypt && localpart != AsBotName {
+	if ThirdPartyIdEncrypt && len(localpart)>0 && localpart != AsBotName {
 		if strings.Index(localpart, AsUserPrefix) == 0 {
 			localpartArr := strings.Split(localpart, AsUserPrefix)
 			if encrypt {
