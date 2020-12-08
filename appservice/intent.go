@@ -9,6 +9,7 @@ package appservice
 import (
 	"errors"
 	"fmt"
+	"maunium.net/go/mautrix/patch"
 	"strings"
 
 	"maunium.net/go/mautrix"
