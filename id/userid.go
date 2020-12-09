@@ -35,7 +35,7 @@ func (userID UserID) Parse() (localpart, homeserver string, err error) {
 		return
 	}
 	parts := strings.Split(string(userID), ":")
-	localpart, homeserver = strings.TrimPrefix(strings.Join(parts[:len(parts)-1], "-"), "@"), parts[len(parts)-1]
+	localpart, homeserver = strings.TrimPrefix(parts[0], "@"), parts[1]
 	localpart = patch.ParseLocalPart(localpart, false)
 	return
 }
