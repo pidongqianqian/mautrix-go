@@ -5,6 +5,7 @@ go 1.14
 require (
 	github.com/btcsuite/btcutil v1.0.2
 	github.com/gorilla/mux v1.7.4
+	github.com/gorilla/websocket v1.4.2 // indirect
 	github.com/lib/pq v1.7.0
 	github.com/mattn/go-sqlite3 v1.14.0
 	github.com/russross/blackfriday/v2 v2.0.1
@@ -15,5 +16,5 @@ require (
 	golang.org/x/crypto v0.0.0-20201016220609-9e8e0b390897
 	golang.org/x/net v0.0.0-20201026091529-146b70c837a4
 	gopkg.in/yaml.v2 v2.3.0
-	maunium.net/go/maulogger/v2 v2.1.1
+	maunium.net/go/maulogger/v2 v2.2.0
 )
