@@ -5,6 +5,7 @@ package mautrix
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,6 +28,11 @@ type Logger interface {
 	Debugfln(message string, args ...interface{})
 }
 
+type WarnLogger interface {
+	Logger
+	Warnfln(message string, args ...interface{})
+}
+
 type Stringifiable interface {
 	String() string
 }
@@ -44,6 +50,10 @@ type Client struct {
 	Store         Storer       // The thing which can store rooms/tokens/ids
 	Logger        Logger
 	SyncPresence  event.Presence
+
+	// Number of times that mautrix will retry any HTTP request
+	// if the request fails entirely or returns a HTTP gateway error (502-504)
+	DefaultHTTPRetries int
 
 	txnID int32
 
@@ -84,8 +94,10 @@ func DiscoverClientAPI(serverName string) (*ClientWellKnown, error) {
 	}
 
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", DefaultUserAgent+" .well-known fetcher")
 
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -187,6 +199,10 @@ func (cli *Client) ClearCredentials() {
 //   - Client.Syncer.ProcessResponse returning an error.
 // If you wish to continue retrying in spite of these fatal errors, call Sync() again.
 func (cli *Client) Sync() error {
+	return cli.SyncWithContext(context.Background())
+}
+
+func (cli *Client) SyncWithContext(ctx context.Context) error {
 	// Mark the client as syncing.
 	// We will keep syncing until the syncing state changes. Either because
 	// Sync is called or StopSync is called.
@@ -203,8 +219,11 @@ func (cli *Client) Sync() error {
 		cli.Store.SaveFilterID(cli.UserID, filterID)
 	}
 	for {
-		resSync, err := cli.SyncRequest(30000, nextBatch, filterID, false, cli.SyncPresence)
+		resSync, err := cli.SyncRequest(30000, nextBatch, filterID, false, cli.SyncPresence, ctx)
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			duration, err2 := cli.Syncer.OnFailedSync(resSync, err)
 			if err2 != nil {
 				return err2
@@ -246,19 +265,79 @@ func (cli *Client) StopSync() {
 	cli.incrementSyncingID()
 }
 
-func (cli *Client) LogRequest(req *http.Request, body string) {
+const logBodyContextKey = "fi.mau.mautrix.log_body"
+const logRequestIDContextKey = "fi.mau.mautrix.request_id"
+
+func (cli *Client) LogRequest(req *http.Request) {
 	if cli.Logger == nil {
 		return
 	}
-	if len(body) > 0 {
-		cli.Logger.Debugfln("%s %s %s", req.Method, req.URL.String(), body)
+	body, ok := req.Context().Value(logBodyContextKey).(string)
+	reqID, _ := req.Context().Value(logRequestIDContextKey).(int)
+	if ok && len(body) > 0 {
+		cli.Logger.Debugfln("req #%d: %s %s %s", reqID, req.Method, req.URL.String(), body)
 	} else {
-		cli.Logger.Debugfln("%s %s", req.Method, req.URL.String())
+		cli.Logger.Debugfln("req #%d: %s %s", reqID, req.Method, req.URL.String())
 	}
 }
 
 func (cli *Client) MakeRequest(method string, httpURL string, reqBody interface{}, resBody interface{}) ([]byte, error) {
-	return cli.MakeFullRequest(method, httpURL, nil, reqBody, resBody)
+	return cli.MakeFullRequest(FullRequest{Method: method, URL: httpURL, RequestJSON: reqBody, ResponseJSON: resBody})
+}
+
+type FullRequest struct {
+	Method        string
+	URL           string
+	Headers       http.Header
+	RequestJSON   interface{}
+	RequestBody   io.Reader
+	RequestLength int64
+	ResponseJSON  interface{}
+	Context       context.Context
+	MaxAttempts   int
+}
+
+var requestID int32
+
+func (params *FullRequest) compileRequest() (*http.Request, error) {
+	var logBody string
+	reqBody := params.RequestBody
+	if params.Context == nil {
+		params.Context = context.Background()
+	}
+	if params.RequestJSON != nil {
+		jsonStr, err := json.Marshal(params.RequestJSON)
+		if err != nil {
+			return nil, HTTPError{
+				Message:      "failed to marshal JSON",
+				WrappedError: err,
+			}
+		}
+		logBody = string(jsonStr)
+		reqBody = bytes.NewBuffer(jsonStr)
+	} else if params.RequestLength > 0 && params.RequestBody != nil {
+		logBody = fmt.Sprintf("%d bytes", params.RequestLength)
+	}
+	ctx := context.WithValue(params.Context, logBodyContextKey, logBody)
+	reqID := atomic.AddInt32(&requestID, 1)
+	ctx = context.WithValue(ctx, logRequestIDContextKey, int(reqID))
+	req, err := http.NewRequestWithContext(ctx, params.Method, params.URL, reqBody)
+	if err != nil {
+		return nil, HTTPError{
+			Message:      "failed to create request",
+			WrappedError: err,
+		}
+	}
+	if params.Headers != nil {
+		req.Header = params.Headers
+	}
+	if params.RequestJSON != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if params.RequestLength > 0 && params.RequestBody != nil {
+		req.ContentLength = params.RequestLength
+	}
+	return req, nil
 }
 
 // MakeFullRequest makes a JSON HTTP request to the given URL.
@@ -267,46 +346,59 @@ func (cli *Client) MakeRequest(method string, httpURL string, reqBody interface{
 // Returns the HTTP body as bytes on 2xx with a nil error. Returns an error if the response is not 2xx along
 // with the HTTP body bytes if it got that far. This error is an HTTPError which includes the returned
 // HTTP status code and possibly a RespError as the WrappedError, if the HTTP body could be decoded as a RespError.
-func (cli *Client) MakeFullRequest(method string, httpURL string, headers http.Header, reqBody interface{}, resBody interface{}) ([]byte, error) {
-	var req *http.Request
-	var err error
-	var logBody string
-	if reqBody != nil {
-		var jsonStr []byte
-		jsonStr, err = json.Marshal(reqBody)
-		if err != nil {
-			return nil, HTTPError{
-				Message:      "failed to marshal JSON",
-				WrappedError: err,
-			}
-		}
-		logBody = string(jsonStr)
-		req, err = http.NewRequest(method, httpURL, bytes.NewBuffer(jsonStr))
-	} else {
-		req, err = http.NewRequest(method, httpURL, nil)
+func (cli *Client) MakeFullRequest(params FullRequest) ([]byte, error) {
+	if params.MaxAttempts == 0 {
+		params.MaxAttempts = 1 + cli.DefaultHTTPRetries
 	}
+	req, err := params.compileRequest()
 	if err != nil {
-		return nil, HTTPError{
-			Message:      "failed to create request",
-			WrappedError: err,
-		}
-	}
-	if headers != nil {
-		req.Header = headers
-	}
-	if len(logBody) > 0 {
-		req.Header.Set("Content-Type", "application/json")
+		return nil, err
 	}
 	req.Header.Set("User-Agent", cli.UserAgent)
 	if len(cli.AccessToken) > 0 {
 		req.Header.Set("Authorization", "Bearer "+cli.AccessToken)
 	}
-	cli.LogRequest(req, logBody)
+	return cli.executeCompiledRequest(req, params.MaxAttempts-1, 4*time.Second, params.ResponseJSON)
+}
+
+func (cli *Client) logWarning(format string, args ...interface{}) {
+	warnLogger, ok := cli.Logger.(WarnLogger)
+	if ok {
+		warnLogger.Warnfln(format, args...)
+	} else {
+		cli.Logger.Debugfln(format, args...)
+	}
+}
+
+func (cli *Client) doRetry(req *http.Request, cause error, retries int, backoff time.Duration, responseJSON interface{}) ([]byte, error) {
+	reqID, _ := req.Context().Value(logRequestIDContextKey).(int)
+	if req.Body != nil {
+		if req.GetBody == nil {
+			cli.logWarning("Failed to get new body to retry request #%d: GetBody is nil", reqID)
+			return nil, cause
+		}
+		var err error
+		req.Body, err = req.GetBody()
+		if err != nil {
+			cli.logWarning("Failed to get new body to retry request #%d: %v", reqID, err)
+			return nil, cause
+		}
+	}
+	cli.logWarning("Request #%d failed: %v, retrying in %d seconds", reqID, cause, int(backoff.Seconds()))
+	time.Sleep(backoff)
+	return cli.executeCompiledRequest(req, retries-1, backoff*2, responseJSON)
+}
+
+func (cli *Client) executeCompiledRequest(req *http.Request, retries int, backoff time.Duration, responseJSON interface{}) ([]byte, error) {
+	cli.LogRequest(req)
 	res, err := cli.Client.Do(req)
 	if res != nil {
 		defer res.Body.Close()
 	}
 	if err != nil {
+		if retries > 0 {
+			return cli.doRetry(req, err, retries, backoff, responseJSON)
+		}
 		return nil, HTTPError{
 			Request:  req,
 			Response: res,
@@ -314,6 +406,10 @@ func (cli *Client) MakeFullRequest(method string, httpURL string, headers http.H
 			Message:      "request error",
 			WrappedError: err,
 		}
+	}
+
+	if retries > 0 && (res.StatusCode == http.StatusBadGateway || res.StatusCode == http.StatusServiceUnavailable || res.StatusCode == http.StatusGatewayTimeout) {
+		return cli.doRetry(req, fmt.Errorf("HTTP %d", res.StatusCode), retries, backoff, responseJSON)
 	}
 
 	contents, err := ioutil.ReadAll(res.Body)
@@ -340,11 +436,11 @@ func (cli *Client) MakeFullRequest(method string, httpURL string, headers http.H
 		}
 	}
 
-	if resBody == nil {
+	if responseJSON == nil {
 		return contents, nil
 	}
 
-	if err = json.Unmarshal(contents, &resBody); err != nil {
+	if err = json.Unmarshal(contents, &responseJSON); err != nil {
 		return nil, HTTPError{
 			Request:  req,
 			Response: res,
@@ -373,7 +469,7 @@ func (cli *Client) CreateFilter(filter *Filter) (resp *RespCreateFilter, err err
 }
 
 // SyncRequest makes an HTTP request according to http://matrix.org/docs/spec/client_server/r0.2.0.html#get-matrix-client-r0-sync
-func (cli *Client) SyncRequest(timeout int, since, filterID string, fullState bool, setPresence event.Presence) (resp *RespSync, err error) {
+func (cli *Client) SyncRequest(timeout int, since, filterID string, fullState bool, setPresence event.Presence, ctx context.Context) (resp *RespSync, err error) {
 	query := map[string]string{
 		"timeout": strconv.Itoa(timeout),
 	}
@@ -390,7 +486,14 @@ func (cli *Client) SyncRequest(timeout int, since, filterID string, fullState bo
 		query["full_state"] = "true"
 	}
 	urlPath := cli.BuildURLWithQuery(URLPath{"sync"}, query)
-	_, err = cli.MakeRequest("GET", urlPath, nil, &resp)
+	_, err = cli.MakeFullRequest(FullRequest{
+		Method:       http.MethodGet,
+		URL:          urlPath,
+		ResponseJSON: &resp,
+		Context:      ctx,
+		// We don't want automatic retries for SyncRequest, the Sync() wrapper handles those.
+		MaxAttempts: 1,
+	})
 	return
 }
 
@@ -400,18 +503,14 @@ func (cli *Client) register(url string, req *ReqRegister) (resp *RespRegister, u
 	bodyBytes, err = cli.MakeRequest("POST", url, req, nil)
 	if err != nil {
 		httpErr, ok := err.(HTTPError)
-		if !ok { // network error
-			return
-		}
-		if httpErr.IsStatus(http.StatusUnauthorized) {
-			// body should be RespUserInteractive, if it isn't, fail with the error
+		// if response has a 401 status, but doesn't have the errcode field, it's probably a UIA response.
+		if ok && httpErr.IsStatus(http.StatusUnauthorized) && httpErr.RespError == nil {
 			err = json.Unmarshal(bodyBytes, &uiaResp)
-			return
 		}
-		return
+	} else {
+		// body should be RespRegister
+		err = json.Unmarshal(bodyBytes, &resp)
 	}
-	// body should be RespRegister
-	err = json.Unmarshal(bodyBytes, &resp)
 	return
 }
 
@@ -490,6 +589,14 @@ func (cli *Client) Login(req *ReqLogin) (resp *RespLogin, err error) {
 // This does not clear the credentials from the client instance. See ClearCredentials() instead.
 func (cli *Client) Logout() (resp *RespLogout, err error) {
 	urlPath := cli.BuildURL("logout")
+	_, err = cli.MakeRequest("POST", urlPath, nil, &resp)
+	return
+}
+
+// LogoutAll logs out all the devices of the current user. See https://matrix.org/docs/spec/client_server/r0.6.1#post-matrix-client-r0-logout-all
+// This does not clear the credentials from the client instance. See ClearCredentials() instead.
+func (cli *Client) LogoutAll() (resp *RespLogout, err error) {
+	urlPath := cli.BuildURL("logout", "all")
 	_, err = cli.MakeRequest("POST", urlPath, nil, &resp)
 	return
 }
@@ -593,6 +700,22 @@ func (cli *Client) GetAccountData(name string, output interface{}) (err error) {
 // SetAccountData sets the user's account data of this type. See https://matrix.org/docs/spec/client_server/r0.6.1#put-matrix-client-r0-user-userid-account-data-type
 func (cli *Client) SetAccountData(name string, data interface{}) (err error) {
 	urlPath := cli.BuildURL("user", cli.UserID, "account_data", name)
+	_, err = cli.MakeRequest("PUT", urlPath, &data, nil)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (cli *Client) GetRoomAccountData(roomID id.RoomID, name string, output interface{}) (err error) {
+	urlPath := cli.BuildURL("user", cli.UserID, "rooms", roomID, "account_data", name)
+	_, err = cli.MakeRequest("GET", urlPath, nil, output)
+	return
+}
+
+func (cli *Client) SetRoomAccountData(roomID id.RoomID, name string, data interface{}) (err error) {
+	urlPath := cli.BuildURL("user", cli.UserID, "rooms", roomID, "account_data", name)
 	_, err = cli.MakeRequest("PUT", urlPath, &data, nil)
 	if err != nil {
 		return err
@@ -790,6 +913,19 @@ func (cli *Client) UserTyping(roomID id.RoomID, typing bool, timeout int64) (res
 	return
 }
 
+// GetPresence gets the presence of the user with the specified MXID. See https://matrix.org/docs/spec/client_server/r0.6.1#get-matrix-client-r0-presence-userid-status
+func (cli *Client) GetPresence(userID id.UserID) (resp *RespPresence, err error) {
+	resp = new(RespPresence)
+	u := cli.BuildURL("presence", userID, "status")
+	_, err = cli.MakeRequest("GET", u, nil, resp)
+	return
+}
+
+// GetOwnPresence gets the user's presence. See https://matrix.org/docs/spec/client_server/r0.6.1#get-matrix-client-r0-presence-userid-status
+func (cli *Client) GetOwnPresence() (resp *RespPresence, err error) {
+	return cli.GetPresence(cli.UserID)
+}
+
 func (cli *Client) SetPresence(status event.Presence) (err error) {
 	req := ReqPresence{Presence: status}
 	u := cli.BuildURL("presence", cli.UserID, "status")
@@ -852,7 +988,7 @@ func (cli *Client) UploadBytesWithName(data []byte, contentType, fileName string
 	})
 }
 
-// UploadMedia uploads the given data to the content repository and returns an MXC URI.
+// Upload uploads the given data to the content repository and returns an MXC URI.
 //
 // Deprecated: UploadMedia should be used instead.
 func (cli *Client) Upload(content io.Reader, contentType string, contentLength int64) (*RespMediaUpload, error) {
@@ -880,62 +1016,21 @@ func (cli *Client) UploadMedia(data ReqUploadMedia) (*RespMediaUpload, error) {
 		u.RawQuery = q.Encode()
 	}
 
-	req, err := http.NewRequest("POST", u.String(), data.Content)
-	if err != nil {
-		return nil, HTTPError{
-			WrappedError: err,
-			Message:      "failed to create request",
-		}
-	}
-
+	var headers http.Header
 	if len(data.ContentType) > 0 {
-		req.Header.Set("Content-Type", data.ContentType)
+		headers = http.Header{"Content-Type": []string{data.ContentType}}
 	}
-	req.Header.Set("Authorization", "Bearer "+cli.AccessToken)
-	req.ContentLength = data.ContentLength
 
-	cli.LogRequest(req, fmt.Sprintf("%d bytes", data.ContentLength))
-
-	res, err := cli.Client.Do(req)
-	if res != nil {
-		defer res.Body.Close()
-	}
-	if err != nil {
-		return nil, err
-	}
-	contents, err := ioutil.ReadAll(res.Body)
-	if err != nil {
-		return nil, HTTPError{
-			Message:      "failed to read upload response body",
-			WrappedError: err,
-			Response:     res,
-			Request:      req,
-		}
-	}
-	if res.StatusCode != 200 {
-		respErr := &RespError{}
-		if _ = json.Unmarshal(contents, respErr); respErr.ErrCode == "" {
-			respErr = nil
-		}
-
-		return nil, HTTPError{
-			Request:   req,
-			Response:  res,
-			RespError: respErr,
-		}
-	}
 	var m RespMediaUpload
-	if err := json.Unmarshal(contents, &m); err != nil {
-		return nil, HTTPError{
-			Request:  req,
-			Response: res,
-
-			Message:      "failed to unmarshal upload response body",
-			ResponseBody: string(contents),
-			WrappedError: err,
-		}
-	}
-	return &m, nil
+	_, err := cli.MakeFullRequest(FullRequest{
+		Method:        http.MethodPost,
+		URL:           u.String(),
+		Headers:       headers,
+		RequestBody:   data.Content,
+		RequestLength: data.ContentLength,
+		ResponseJSON:  &m,
+	})
+	return &m, err
 }
 
 // JoinedMembers returns a map of joined room members. See https://matrix.org/docs/spec/client_server/r0.4.0.html#get-matrix-client-r0-joined-rooms
@@ -1026,13 +1121,28 @@ func (cli *Client) MarkRead(roomID id.RoomID, eventID id.EventID) (err error) {
 	return
 }
 
-func (cli *Client) AddTag(roomID id.RoomID, tag string, order float64) (err error) {
-	urlPath := cli.BuildURL("user", cli.UserID, "rooms", roomID, "tags", tag)
+func (cli *Client) AddTag(roomID id.RoomID, tag string, order float64) error {
 	var tagData event.Tag
 	if order == order {
 		tagData.Order = json.Number(strconv.FormatFloat(order, 'e', -1, 64))
 	}
-	_, err = cli.MakeRequest("PUT", urlPath, tagData, nil)
+	return cli.AddTagWithCustomData(roomID, tag, tagData)
+}
+
+func (cli *Client) AddTagWithCustomData(roomID id.RoomID, tag string, data interface{}) (err error) {
+	urlPath := cli.BuildURL("user", cli.UserID, "rooms", roomID, "tags", tag)
+	_, err = cli.MakeRequest("PUT", urlPath, data, nil)
+	return
+}
+
+func (cli *Client) GetTags(roomID id.RoomID) (tags event.TagEventContent, err error) {
+	err = cli.GetTagsWithCustomData(roomID, &tags)
+	return
+}
+
+func (cli *Client) GetTagsWithCustomData(roomID id.RoomID, resp interface{}) (err error) {
+	urlPath := cli.BuildURL("user", cli.UserID, "rooms", roomID, "tags")
+	_, err = cli.MakeRequest("GET", urlPath, nil, &resp)
 	return
 }
 
@@ -1042,12 +1152,11 @@ func (cli *Client) RemoveTag(roomID id.RoomID, tag string) (err error) {
 	return
 }
 
+// Deprecated: Synapse may not handle setting m.tag directly properly, so you should use the Add/RemoveTag methods instead.
 func (cli *Client) SetTags(roomID id.RoomID, tags event.Tags) (err error) {
-	urlPath := cli.BuildURL("user", cli.UserID, "rooms", roomID, "account_data", "m.tag")
-	_, err = cli.MakeRequest("PUT", urlPath, map[string]event.Tags{
+	return cli.SetRoomAccountData(roomID, "m.tag", map[string]event.Tags{
 		"tags": tags,
-	}, nil)
-	return
+	})
 }
 
 // TurnServer returns turn server details and credentials for the client to use when initiating calls.
@@ -1107,6 +1216,36 @@ func (cli *Client) SendToDevice(eventType event.Type, req *ReqSendToDevice) (res
 	urlPath := cli.BuildURL("sendToDevice", eventType.String(), cli.TxnID())
 	_, err = cli.MakeRequest("PUT", urlPath, req, &resp)
 	return
+}
+
+func (cli *Client) GetDevicesInfo() (resp *RespDevicesInfo, err error) {
+	urlPath := cli.BuildURL("devices")
+	_, err = cli.MakeRequest("GET", urlPath, nil, &resp)
+	return
+}
+
+func (cli *Client) GetDeviceInfo(deviceID id.DeviceID) (resp *RespDeviceInfo, err error) {
+	urlPath := cli.BuildURL("devices", deviceID)
+	_, err = cli.MakeRequest("GET", urlPath, nil, &resp)
+	return
+}
+
+func (cli *Client) SetDeviceInfo(deviceID id.DeviceID, req *ReqDeviceInfo) error {
+	urlPath := cli.BuildURL("devices", deviceID)
+	_, err := cli.MakeRequest("PUT", urlPath, req, nil)
+	return err
+}
+
+func (cli *Client) DeleteDevice(deviceID id.DeviceID, req *ReqDeleteDevice) error {
+	urlPath := cli.BuildURL("devices", deviceID)
+	_, err := cli.MakeRequest("DELETE", urlPath, req, nil)
+	return err
+}
+
+func (cli *Client) DeleteDevices(req *ReqDeleteDevices) error {
+	urlPath := cli.BuildURL("delete_devices")
+	_, err := cli.MakeRequest("DELETE", urlPath, req, nil)
+	return err
 }
 
 type UIACallback = func(*RespUserInteractive) interface{}
@@ -1197,10 +1336,10 @@ func NewClient(homeserverURL string, userID id.UserID, accessToken string) (*Cli
 	}
 	return &Client{
 		AccessToken:   accessToken,
-		UserAgent:     "mautrix-go " + Version,
+		UserAgent:     DefaultUserAgent,
 		HomeserverURL: hsURL,
 		UserID:        userID,
-		Client:        http.DefaultClient,
+		Client:        &http.Client{Timeout: 180 * time.Second},
 		Prefix:        URLPath{"_matrix", "client", "r0"},
 		Syncer:        NewDefaultSyncer(),
 		// By default, use an in-memory store which will never save filter ids / next batch tokens to disk.

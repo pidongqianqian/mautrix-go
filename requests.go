@@ -20,7 +20,8 @@ const (
 	AuthTypeToken     = "m.login.token"
 	AuthTypeDummy     = "m.login.dummy"
 
-	AuthTypeAppservice = "uk.half-shot.msc2778.login.application_service"
+	AuthTypeAppservice      = "m.login.application_service"
+	AuthTypeHalfyAppservice = "uk.half-shot.msc2778.login.application_service"
 )
 
 type IdentifierType string
@@ -31,19 +32,23 @@ const (
 	IdentifierTypePhone      = "m.id.phone"
 )
 
-// ReqRegister is the JSON request for http://matrix.org/docs/spec/client_server/r0.2.0.html#post-matrix-client-r0-register
+// ReqRegister is the JSON request for https://matrix.org/docs/spec/client_server/r0.6.1#post-matrix-client-r0-register
 type ReqRegister struct {
 	Username                 string      `json:"username,omitempty"`
-	BindEmail                bool        `json:"bind_email,omitempty"`
 	Password                 string      `json:"password,omitempty"`
 	DeviceID                 id.DeviceID `json:"device_id,omitempty"`
-	InitialDeviceDisplayName string      `json:"initial_device_display_name"`
+	InitialDeviceDisplayName string      `json:"initial_device_display_name,omitempty"`
+	InhibitLogin             bool        `json:"inhibit_login,omitempty"`
 	Auth                     interface{} `json:"auth,omitempty"`
+
+	// Type for registration, only used for appservice user registrations
+	// https://matrix.org/docs/spec/application_service/r0.1.2#server-admin-style-permissions
+	Type AuthType `json:"type,omitempty"`
 }
 
 type BaseAuthData struct {
 	Type    AuthType `json:"type"`
-	Session string   `json:"session"`
+	Session string   `json:"session,omitempty"`
 }
 
 type UserIdentifier struct {
@@ -269,6 +274,22 @@ type OneTimeKeysRequest map[id.UserID]map[id.DeviceID]id.KeyAlgorithm
 
 type ReqSendToDevice struct {
 	Messages map[id.UserID]map[id.DeviceID]*event.Content `json:"messages"`
+}
+
+// ReqDeviceInfo is the JSON request for https://matrix.org/docs/spec/client_server/r0.6.1#put-matrix-client-r0-devices-deviceid
+type ReqDeviceInfo struct {
+	DisplayName string `json:"display_name,omitempty"`
+}
+
+// ReqDeleteDevice is the JSON request for https://matrix.org/docs/spec/client_server/r0.6.1#delete-matrix-client-r0-devices-deviceid
+type ReqDeleteDevice struct {
+	Auth interface{} `json:"auth,omitempty"`
+}
+
+// ReqDeleteDevices is the JSON request for https://matrix.org/docs/spec/client_server/r0.6.1#post-matrix-client-r0-delete-devices
+type ReqDeleteDevices struct {
+	Devices []id.DeviceID `json:"devices"`
+	Auth    interface{}   `json:"auth,omitempty"`
 }
 
 type ReqPutPushRule struct {

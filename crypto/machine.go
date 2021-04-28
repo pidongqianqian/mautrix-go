@@ -158,7 +158,7 @@ func (mach *OlmMachine) OwnIdentity() *DeviceIdentity {
 // This can be easily registered into a mautrix client using .OnSync():
 //
 //     client.Syncer.(*mautrix.DefaultSyncer).OnSync(c.crypto.ProcessSyncResponse)
-func (mach *OlmMachine) ProcessSyncResponse(resp *mautrix.RespSync, since string) {
+func (mach *OlmMachine) ProcessSyncResponse(resp *mautrix.RespSync, since string) bool {
 	if len(resp.DeviceLists.Changed) > 0 {
 		mach.Log.Trace("Device list changes in /sync: %v", resp.DeviceLists.Changed)
 		mach.fetchKeys(resp.DeviceLists.Changed, since, false)
@@ -182,13 +182,14 @@ func (mach *OlmMachine) ProcessSyncResponse(resp *mautrix.RespSync, since string
 			mach.Log.Error("Failed to share keys: %v", err)
 		}
 	}
+	return true
 }
 
 // HandleMemberEvent handles a single membership event.
 //
 // Currently this is not automatically called, so you must add a listener yourself:
 //
-//     client.Syncer.(*mautrix.DefaultSyncer).OnSync(c.crypto.ProcessSyncResponse)
+//     client.Syncer.(*mautrix.DefaultSyncer).OnEventType(event.StateMember, c.crypto.HandleMemberEvent)
 func (mach *OlmMachine) HandleMemberEvent(evt *event.Event) {
 	if !mach.StateStore.IsEncrypted(evt.RoomID) {
 		return
@@ -223,23 +224,25 @@ func (mach *OlmMachine) HandleMemberEvent(evt *event.Event) {
 func (mach *OlmMachine) HandleToDeviceEvent(evt *event.Event) {
 	switch content := evt.Content.Parsed.(type) {
 	case *event.EncryptedEventContent:
-		mach.Log.Trace("Handling encrypted to-device event from %s/%s", evt.Sender, content.DeviceID)
+		mach.Log.Debug("Handling encrypted to-device event from %s/%s", evt.Sender, content.SenderKey)
 		decryptedEvt, err := mach.decryptOlmEvent(evt)
 		if err != nil {
 			mach.Log.Error("Failed to decrypt to-device event: %v", err)
 			return
 		}
-		switch content := decryptedEvt.Content.Parsed.(type) {
+		switch decryptedContent := decryptedEvt.Content.Parsed.(type) {
 		case *event.RoomKeyEventContent:
-			mach.receiveRoomKey(decryptedEvt, content)
+			mach.receiveRoomKey(decryptedEvt, decryptedContent)
 		case *event.ForwardedRoomKeyEventContent:
-			if mach.importForwardedRoomKey(decryptedEvt, content) {
-				if ch, ok := mach.roomKeyRequestFilled.Load(content.SessionID); ok {
+			if mach.importForwardedRoomKey(decryptedEvt, decryptedContent) {
+				if ch, ok := mach.roomKeyRequestFilled.Load(decryptedContent.SessionID); ok {
 					// close channel to notify listener that the key was received
 					close(ch.(chan struct{}))
 				}
 			}
-			// TODO handle m.dummy encrypted to-device event
+			// TODO handle m.dummy encrypted to-device event?
+		default:
+			mach.Log.Debug("Unhandled encrypted to-device event of type %s from %s/%s", decryptedEvt.Type.String(), decryptedEvt.Sender, decryptedEvt.SenderDevice)
 		}
 	case *event.RoomKeyRequestEventContent:
 		mach.handleRoomKeyRequest(evt.Sender, content)
@@ -286,7 +289,7 @@ func (mach *OlmMachine) GetOrFetchDevice(userID id.UserID, deviceID id.DeviceID)
 }
 
 // SendEncryptedToDevice sends an Olm-encrypted event to the given user device.
-func (mach *OlmMachine) SendEncryptedToDevice(device *DeviceIdentity, content event.Content) error {
+func (mach *OlmMachine) SendEncryptedToDevice(device *DeviceIdentity, evtType event.Type, content event.Content) error {
 	// create outbound sessions if missing
 	if err := mach.createOutboundSessions(map[id.UserID]map[id.DeviceID]*DeviceIdentity{
 		device.UserID: {
@@ -295,6 +298,9 @@ func (mach *OlmMachine) SendEncryptedToDevice(device *DeviceIdentity, content ev
 	}); err != nil {
 		return err
 	}
+
+	mach.olmLock.Lock()
+	defer mach.olmLock.Unlock()
 
 	// get Olm session
 	olmSess, err := mach.CryptoStore.GetLatestSession(device.IdentityKey)
@@ -305,12 +311,10 @@ func (mach *OlmMachine) SendEncryptedToDevice(device *DeviceIdentity, content ev
 		return fmt.Errorf("didn't find created outbound session for device %s of %s", device.DeviceID, device.UserID)
 	}
 
-	mach.olmLock.Lock()
-	defer mach.olmLock.Unlock()
-
-	encrypted := mach.encryptOlmEvent(olmSess, device, event.ToDeviceForwardedRoomKey, content)
+	encrypted := mach.encryptOlmEvent(olmSess, device, evtType, content)
 	encryptedContent := &event.Content{Parsed: &encrypted}
 
+	mach.Log.Debug("Sending encrypted to-device event of type %s to %s/%s (identity key: %s, olm session ID: %s)", evtType.Type, device.UserID, device.DeviceID, device.IdentityKey, olmSess.ID())
 	_, err = mach.Client.SendToDevice(event.ToDeviceEncrypted,
 		&mautrix.ReqSendToDevice{
 			Messages: map[id.UserID]map[id.DeviceID]*event.Content{
@@ -375,6 +379,7 @@ func (mach *OlmMachine) WaitForSession(roomID id.RoomID, senderKey id.SenderKey,
 func (mach *OlmMachine) receiveRoomKey(evt *DecryptedOlmEvent, content *event.RoomKeyEventContent) {
 	// TODO nio had a comment saying "handle this better" for the case where evt.Keys.Ed25519 is none?
 	if content.Algorithm != id.AlgorithmMegolmV1 || evt.Keys.Ed25519 == "" {
+		mach.Log.Debug("Ignoring weird room key from %s/%s: alg=%s, ed25519=%s, sessionid=%s, roomid=%s", evt.Sender, evt.SenderDevice, content.Algorithm, evt.Keys.Ed25519, content.SessionID, content.RoomID)
 		return
 	}
 

@@ -47,11 +47,9 @@ func (as *AppService) NewIntentAPI(localpart string) *IntentAPI {
 func (intent *IntentAPI) Register() error {
 	_, _, err := intent.Client.Register(&mautrix.ReqRegister{
 		Username: intent.Localpart,
+		Type:     mautrix.AuthTypeAppservice,
 	})
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }
 
 func (intent *IntentAPI) EnsureRegistered() error {
