@@ -47,11 +47,9 @@ func (as *AppService) NewIntentAPI(localpart string) *IntentAPI {
 func (intent *IntentAPI) Register() error {
 	_, _, err := intent.Client.Register(&mautrix.ReqRegister{
 		Username: intent.Localpart,
+		Type:     mautrix.AuthTypeAppservice,
 	})
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }
 
 func (intent *IntentAPI) EnsureRegistered() error {
@@ -231,7 +229,7 @@ func (intent *IntentAPI) SetRoomName(roomID id.RoomID, roomName string) (*mautri
 
 func (intent *IntentAPI) SetRoomAvatar(roomID id.RoomID, avatarURL id.ContentURI) (*mautrix.RespSendEvent, error) {
 	return intent.SendStateEvent(roomID, event.StateRoomAvatar, "", map[string]interface{}{
-		"url": avatarURL,
+		"url": avatarURL.String(),
 	})
 }
 
