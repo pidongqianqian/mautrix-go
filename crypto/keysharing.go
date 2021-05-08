@@ -110,6 +110,7 @@ func (mach *OlmMachine) RequestRoomKey(ctx context.Context, toUser id.UserID, to
 
 func (mach *OlmMachine) importForwardedRoomKey(evt *DecryptedOlmEvent, content *event.ForwardedRoomKeyEventContent) bool {
 	if content.Algorithm != id.AlgorithmMegolmV1 || evt.Keys.Ed25519 == "" {
+		mach.Log.Debug("Ignoring weird forwarded room key from %s/%s: alg=%s, ed25519=%s, sessionid=%s, roomid=%s", evt.Sender, evt.SenderDevice, content.Algorithm, evt.Keys.Ed25519, content.SessionID, content.RoomID)
 		return false
 	}
 
@@ -135,7 +136,7 @@ func (mach *OlmMachine) importForwardedRoomKey(evt *DecryptedOlmEvent, content *
 		return false
 	}
 	mach.markSessionReceived(content.SessionID)
-	mach.Log.Trace("Created inbound group session %s/%s/%s", content.RoomID, content.SenderKey, content.SessionID)
+	mach.Log.Trace("Received forwarded inbound group session %s/%s/%s", content.RoomID, content.SenderKey, content.SessionID)
 	return true
 }
 
@@ -192,7 +193,7 @@ func (mach *OlmMachine) handleRoomKeyRequest(sender id.UserID, content *event.Ro
 		return
 	}
 
-	mach.Log.Debug("Received key request %s for %s from %s/%s for session %s", content.RequestID, content.Body.SessionID, sender, content.RequestingDeviceID, content.Body.SessionID)
+	mach.Log.Debug("Received key request %s for %s from %s/%s", content.RequestID, content.Body.SessionID, sender, content.RequestingDeviceID)
 
 	device, err := mach.GetOrFetchDevice(sender, content.RequestingDeviceID)
 	if err != nil {
@@ -238,7 +239,7 @@ func (mach *OlmMachine) handleRoomKeyRequest(sender id.UserID, content *event.Ro
 		},
 	}
 
-	if err := mach.SendEncryptedToDevice(device, forwardedRoomKey); err != nil {
+	if err := mach.SendEncryptedToDevice(device, event.ToDeviceForwardedRoomKey, forwardedRoomKey); err != nil {
 		mach.Log.Error("Failed to send encrypted forwarded key %s to %s/%s: %v", igs.ID(), device.UserID, device.DeviceID, err)
 	}
 

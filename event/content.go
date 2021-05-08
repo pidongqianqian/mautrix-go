@@ -67,6 +67,14 @@ var TypeMap = map[Type]reflect.Type{
 	ToDeviceVerificationRequest: reflect.TypeOf(VerificationRequestEventContent{}),
 
 	ToDeviceOrgMatrixRoomKeyWithheld: reflect.TypeOf(RoomKeyWithheldEventContent{}),
+
+	CallInvite:       reflect.TypeOf(CallInviteEventContent{}),
+	CallCandidates:   reflect.TypeOf(CallCandidatesEventContent{}),
+	CallAnswer:       reflect.TypeOf(CallAnswerEventContent{}),
+	CallReject:       reflect.TypeOf(CallRejectEventContent{}),
+	CallSelectAnswer: reflect.TypeOf(CallSelectAnswerEventContent{}),
+	CallNegotiate:    reflect.TypeOf(CallNegotiateEventContent{}),
+	CallHangup:       reflect.TypeOf(CallHangupEventContent{}),
 }
 
 // Content stores the content of a Matrix event.
@@ -137,7 +145,7 @@ func IsUnsupportedContentType(err error) bool {
 }
 
 var ContentAlreadyParsed = errors.New("content is already parsed")
-var UnsupportedContentType = errors.New("unsupported content type")
+var UnsupportedContentType = errors.New("unsupported event type")
 
 func (content *Content) ParseRaw(evtType Type) error {
 	if content.Parsed != nil {
@@ -395,6 +403,55 @@ func (content *Content) AsRoomKeyWithheld() *RoomKeyWithheldEventContent {
 	casted, ok := content.Parsed.(*RoomKeyWithheldEventContent)
 	if !ok {
 		return &RoomKeyWithheldEventContent{}
+	}
+	return casted
+}
+func (content *Content) AsCallInvite() *CallInviteEventContent {
+	casted, ok := content.Parsed.(*CallInviteEventContent)
+	if !ok {
+		return &CallInviteEventContent{}
+	}
+	return casted
+}
+func (content *Content) AsCallCandidates() *CallCandidatesEventContent {
+	casted, ok := content.Parsed.(*CallCandidatesEventContent)
+	if !ok {
+		return &CallCandidatesEventContent{}
+	}
+	return casted
+}
+func (content *Content) AsCallAnswer() *CallAnswerEventContent {
+	casted, ok := content.Parsed.(*CallAnswerEventContent)
+	if !ok {
+		return &CallAnswerEventContent{}
+	}
+	return casted
+}
+func (content *Content) AsCallReject() *CallRejectEventContent {
+	casted, ok := content.Parsed.(*CallRejectEventContent)
+	if !ok {
+		return &CallRejectEventContent{}
+	}
+	return casted
+}
+func (content *Content) AsCallSelectAnswer() *CallSelectAnswerEventContent {
+	casted, ok := content.Parsed.(*CallSelectAnswerEventContent)
+	if !ok {
+		return &CallSelectAnswerEventContent{}
+	}
+	return casted
+}
+func (content *Content) AsCallNegotiate() *CallNegotiateEventContent {
+	casted, ok := content.Parsed.(*CallNegotiateEventContent)
+	if !ok {
+		return &CallNegotiateEventContent{}
+	}
+	return casted
+}
+func (content *Content) AsCallHangup() *CallHangupEventContent {
+	casted, ok := content.Parsed.(*CallHangupEventContent)
+	if !ok {
+		return &CallHangupEventContent{}
 	}
 	return casted
 }

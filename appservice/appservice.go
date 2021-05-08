@@ -12,11 +12,16 @@ import (
 	"html/template"
 	"io/ioutil"
 	"net/http"
+	"net/http/cookiejar"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/gorilla/websocket"
+	"golang.org/x/net/publicsuffix"
 	"gopkg.in/yaml.v2"
 
 	"maunium.net/go/maulogger/v2"
@@ -31,12 +36,15 @@ var EventChannelSize = 64
 
 // Create a blank appservice instance.
 func Create() *AppService {
+	jar, _ := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
 	return &AppService{
 		LogConfig:  CreateLogConfig(),
 		clients:    make(map[id.UserID]*mautrix.Client),
 		intents:    make(map[id.UserID]*IntentAPI),
+		HTTPClient: &http.Client{Timeout: 180 * time.Second, Jar: jar},
 		StateStore: NewBasicStateStore(),
 		Router:     mux.NewRouter(),
+		UserAgent:  mautrix.DefaultUserAgent,
 	}
 }
 
@@ -90,12 +98,29 @@ type AppService struct {
 	QueryHandler QueryHandler      `yaml:"-"`
 	StateStore   StateStore        `yaml:"-"`
 
-	Router    *mux.Router `yaml:"-"`
-	server    *http.Server
-	botClient *mautrix.Client
-	botIntent *IntentAPI
-	clients   map[id.UserID]*mautrix.Client
-	intents   map[id.UserID]*IntentAPI
+	Router     *mux.Router `yaml:"-"`
+	UserAgent  string      `yaml:"-"`
+	server     *http.Server
+	HTTPClient *http.Client
+	botClient  *mautrix.Client
+	botIntent  *IntentAPI
+
+	DefaultHTTPRetries int
+
+	clients     map[id.UserID]*mautrix.Client
+	clientsLock sync.RWMutex
+	intents     map[id.UserID]*IntentAPI
+	intentsLock sync.RWMutex
+
+	ws                *websocket.Conn
+	StopWebsocket     func(error)
+	WebsocketCommands chan WebsocketCommand
+}
+
+func (as *AppService) PrepareWebsocket() {
+	if as.WebsocketCommands == nil {
+		as.WebsocketCommands = make(chan WebsocketCommand, 32)
+	}
 }
 
 // HostConfig contains info about how to host the appservice.
@@ -133,57 +158,87 @@ func (as *AppService) BotMXID() id.UserID {
 	return id.NewUserID(as.Registration.SenderLocalpart, as.HomeserverDomain)
 }
 
-func (as *AppService) Intent(userID id.UserID) *IntentAPI {
+func (as *AppService) makeIntent(userID id.UserID) *IntentAPI {
+	as.intentsLock.Lock()
+	defer as.intentsLock.Unlock()
+
 	intent, ok := as.intents[userID]
-	if !ok {
-		localpart, homeserver, err := userID.Parse()
-		if err != nil || len(localpart) == 0 || homeserver != as.HomeserverDomain {
-			return nil
+	if ok {
+		return intent
+	}
+
+	localpart, homeserver, err := userID.Parse()
+	if err != nil || len(localpart) == 0 || homeserver != as.HomeserverDomain {
+		if err != nil {
+			as.Log.Fatalfln("Failed to parse user ID %s: %v", userID, err)
+		} else if len(localpart) == 0 {
+			as.Log.Fatalfln("Failed to make intent for %s: localpart is empty", userID)
+		} else if homeserver != as.HomeserverDomain {
+			as.Log.Fatalfln("Failed to make intent for %s: homeserver isn't %s", userID, as.HomeserverDomain)
 		}
-		intent = as.NewIntentAPI(localpart)
-		as.intents[userID] = intent
+		return nil
+	}
+	intent = as.NewIntentAPI(localpart)
+	as.intents[userID] = intent
+	return intent
+}
+
+func (as *AppService) Intent(userID id.UserID) *IntentAPI {
+	as.intentsLock.RLock()
+	intent, ok := as.intents[userID]
+	as.intentsLock.RUnlock()
+	if !ok {
+		return as.makeIntent(userID)
 	}
 	return intent
 }
 
 func (as *AppService) BotIntent() *IntentAPI {
 	if as.botIntent == nil {
-		as.botIntent = as.NewIntentAPI(as.Registration.SenderLocalpart)
-		as.botIntent.Logger = as.Log.Sub(string(as.botIntent.UserID))
+		as.botIntent = as.makeIntent(as.BotMXID())
 	}
 	return as.botIntent
 }
 
-func (as *AppService) Client(userID id.UserID) *mautrix.Client {
+func (as *AppService) makeClient(userID id.UserID) *mautrix.Client {
+	as.clientsLock.Lock()
+	defer as.clientsLock.Unlock()
+
 	client, ok := as.clients[userID]
+	if ok {
+		return client
+	}
+
+	client, err := mautrix.NewClient(as.HomeserverURL, userID, as.Registration.AppToken)
+	if err != nil {
+		as.Log.Fatalln("Failed to create mautrix client instance:", err)
+		return nil
+	}
+	client.UserAgent = as.UserAgent
+	client.Syncer = nil
+	client.Store = nil
+	client.AppServiceUserID = userID
+	client.Logger = as.Log.Sub(string(userID))
+	client.Client = as.HTTPClient
+	client.DefaultHTTPRetries = as.DefaultHTTPRetries
+	as.clients[userID] = client
+	return client
+}
+
+func (as *AppService) Client(userID id.UserID) *mautrix.Client {
+	as.clientsLock.RLock()
+	client, ok := as.clients[userID]
+	as.clientsLock.RUnlock()
 	if !ok {
-		var err error
-		client, err = mautrix.NewClient(as.HomeserverURL, userID, as.Registration.AppToken)
-		if err != nil {
-			as.Log.Fatalln("Failed to create gomatrix instance:", err)
-			return nil
-		}
-		client.Syncer = nil
-		client.Store = nil
-		client.AppServiceUserID = userID
-		client.Logger = as.Log.Sub(string(userID))
-		as.clients[userID] = client
+		return as.makeClient(userID)
 	}
 	return client
 }
 
 func (as *AppService) BotClient() *mautrix.Client {
 	if as.botClient == nil {
-		var err error
-		as.botClient, err = mautrix.NewClient(as.HomeserverURL, as.BotMXID(), as.Registration.AppToken)
-		if err != nil {
-			as.Log.Fatalln("Failed to create gomatrix instance:", err)
-			return nil
-		}
-		as.botClient.Syncer = nil
-		as.botClient.Store = nil
+		as.botClient = as.makeClient(as.BotMXID())
 		as.botClient.Logger = as.Log.Sub("Bot")
-		as.botClient.AppServiceUserID = as.BotMXID()
 	}
 	return as.botClient
 }
@@ -192,6 +247,10 @@ func (as *AppService) BotClient() *mautrix.Client {
 func (as *AppService) Init() (bool, error) {
 	as.Events = make(chan *event.Event, EventChannelSize)
 	as.QueryHandler = &QueryHandlerStub{}
+
+	if len(as.UserAgent) == 0 {
+		as.UserAgent = mautrix.DefaultUserAgent
+	}
 
 	as.Log = maulogger.Create()
 	as.LogConfig.Configure(as.Log)
@@ -217,6 +276,8 @@ type LogConfig struct {
 	FileMode        uint32 `yaml:"file_mode"`
 	TimestampFormat string `yaml:"timestamp_format"`
 	RawPrintLevel   string `yaml:"print_level"`
+	JSONStdout      bool   `yaml:"print_json"`
+	JSONFile        bool   `yaml:"file_json"`
 	PrintLevel      int    `yaml:"-"`
 }
 
@@ -306,4 +367,8 @@ func (lc LogConfig) Configure(log maulogger.Logger) {
 	basicLogger.FileTimeFormat = lc.FileDateFormat
 	basicLogger.TimeFormat = lc.TimestampFormat
 	basicLogger.PrintLevel = lc.PrintLevel
+	basicLogger.JSONFile = lc.JSONFile
+	if lc.JSONStdout {
+		basicLogger.EnableJSONStdout()
+	}
 }

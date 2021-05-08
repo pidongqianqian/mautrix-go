@@ -49,6 +49,14 @@ type RespUnbanUser struct{}
 // RespTyping is the JSON response for https://matrix.org/docs/spec/client_server/r0.2.0.html#put-matrix-client-r0-rooms-roomid-typing-userid
 type RespTyping struct{}
 
+// RespPresence is the JSON response for https://matrix.org/docs/spec/client_server/r0.6.1#get-matrix-client-r0-presence-userid-status
+type RespPresence struct {
+	Presence        event.Presence `json:"presence"`
+	LastActiveAgo   int            `json:"last_active_ago"`
+	StatusMsg       string         `json:"status_msg"`
+	CurrentlyActive bool           `json:"currently_active"`
+}
+
 // RespJoinedRooms is the JSON response for https://matrix.org/docs/spec/client_server/r0.4.0.html#get-matrix-client-r0-joined-rooms
 type RespJoinedRooms struct {
 	JoinedRooms []id.RoomID `json:"joined_rooms"`
@@ -270,3 +278,16 @@ type RespKeyChanges struct {
 }
 
 type RespSendToDevice struct{}
+
+// RespDevicesInfo is the JSON response for https://matrix.org/docs/spec/client_server/r0.6.1#get-matrix-client-r0-devices
+type RespDevicesInfo struct {
+	Devices []RespDeviceInfo `json:"devices"`
+}
+
+// RespDeviceInfo is the JSON response for https://matrix.org/docs/spec/client_server/r0.6.1#get-matrix-client-r0-devices-deviceid
+type RespDeviceInfo struct {
+	DeviceID    id.DeviceID `json:"device_id"`
+	DisplayName string      `json:"display_name"`
+	LastSeenIP  string      `json:"last_seen_ip"`
+	LastSeenTS  int64       `json:"last_seen_ts"`
+}
